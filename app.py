@@ -554,24 +554,25 @@ def calcular_probabilidades(goles_a, goles_b, max_goles=8):
     return matriz, resumen, marcadores
 
 
-def graficar_marcadores(matriz, equipo_a, equipo_b, max_goles=5):
+def graficar_marcadores(matriz, equipo_a, equipo_b, max_goles=5, vmin=None, vmax=None):
     datos = matriz[:max_goles + 1, :max_goles + 1] * 100
 
-    fig, ax = plt.subplots(figsize=(8, 6))
-    im = ax.imshow(datos)
+    fig, ax = plt.subplots(figsize=(5.6, 4.0))
+    im = ax.imshow(datos, vmin=vmin, vmax=vmax)
 
-    ax.set_title(f"Probabilidad por marcador\n{equipo_a} vs {equipo_b}")
-    ax.set_xlabel(f"Goles de {equipo_b}")
-    ax.set_ylabel(f"Goles de {equipo_a}")
+    ax.set_title(f"Probabilidad por marcador\n{equipo_a} vs {equipo_b}", fontsize=10)
+    ax.set_xlabel(f"Goles de {equipo_b}", fontsize=9)
+    ax.set_ylabel(f"Goles de {equipo_a}", fontsize=9)
 
     ax.set_xticks(range(max_goles + 1))
     ax.set_yticks(range(max_goles + 1))
+    ax.tick_params(labelsize=8)
 
     for i in range(max_goles + 1):
         for j in range(max_goles + 1):
-            ax.text(j, i, f"{datos[i, j]:.1f}", ha="center", va="center")
+            ax.text(j, i, f"{datos[i, j]:.1f}", ha="center", va="center", fontsize=8)
 
-    fig.colorbar(im, ax=ax, label="Probabilidad (%)")
+    fig.colorbar(im, ax=ax, label="Probabilidad (%)", fraction=0.046, pad=0.04)
     fig.tight_layout()
     return fig
 
@@ -664,6 +665,27 @@ def tabla_marcadores(marcadores):
     return tabla
 
 
+def crear_tabla_marcadores_comparativa(resultados, limite=12):
+    poisson = resultados["Poisson + Elo"]["marcadores"][["Marcador", "Probabilidad"]].rename(
+        columns={"Probabilidad": "Poisson + Elo"}
+    )
+    xgboost = resultados["XGBoost"]["marcadores"][["Marcador", "Probabilidad"]].rename(
+        columns={"Probabilidad": "XGBoost"}
+    )
+
+    tabla = poisson.merge(xgboost, on="Marcador", how="outer").fillna(0)
+    tabla["Relevancia"] = tabla["Poisson + Elo"] + tabla["XGBoost"]
+    tabla["Diferencia"] = tabla["XGBoost"] - tabla["Poisson + Elo"]
+    tabla = tabla.sort_values("Relevancia", ascending=False).head(limite)
+
+    tabla = tabla[["Marcador", "Poisson + Elo", "XGBoost", "Diferencia"]].copy()
+    tabla["Poisson + Elo"] = tabla["Poisson + Elo"].map(formato_porcentaje)
+    tabla["XGBoost"] = tabla["XGBoost"].map(formato_porcentaje)
+    tabla["Diferencia"] = tabla["Diferencia"].map(formato_diferencia)
+
+    return tabla
+
+
 def obtener_favorito(resumen, equipo_a, equipo_b):
     opciones = {
         equipo_a: resumen["Gana equipo A"],
@@ -673,6 +695,14 @@ def obtener_favorito(resumen, equipo_a, equipo_b):
     return max(opciones, key=opciones.get)
 
 
+def probabilidad_favorito(resumen, favorito, equipo_a, equipo_b):
+    if favorito == equipo_a:
+        return resumen["Gana equipo A"]
+    if favorito == equipo_b:
+        return resumen["Gana equipo B"]
+    return resumen["Empate"]
+
+
 def renderizar_cards_principales(resultados, comparar, equipo_a, equipo_b, modelo_unico=None):
     eventos = [
         (f"Gana {equipo_a}", "Gana equipo A"),
@@ -680,7 +710,7 @@ def renderizar_cards_principales(resultados, comparar, equipo_a, equipo_b, model
         (f"Gana {equipo_b}", "Gana equipo B"),
     ]
 
-    columnas = st.columns(3)
+    columnas = st.columns(3, gap="small")
 
     for columna, (titulo, clave) in zip(columnas, eventos):
         with columna:
@@ -690,8 +720,16 @@ def renderizar_cards_principales(resultados, comparar, equipo_a, equipo_b, model
                     poisson_elo = resultados["Poisson + Elo"]["resumen"][clave]
                     xgboost = resultados["XGBoost"]["resumen"][clave]
                     diferencia = xgboost - poisson_elo
-                    st.metric("Poisson + Elo", formato_porcentaje(poisson_elo))
-                    st.metric("XGBoost", formato_porcentaje(xgboost), delta=formato_diferencia(diferencia))
+
+                    c_poisson, c_xgb = st.columns(2, gap="small")
+                    c_poisson.metric("Poisson + Elo", formato_porcentaje(poisson_elo))
+                    c_xgb.metric("XGBoost", formato_porcentaje(xgboost))
+                    st.metric(
+                        "Diferencia XGBoost - Poisson + Elo",
+                        formato_diferencia(diferencia),
+                        delta=formato_diferencia(diferencia),
+                        delta_color="normal"
+                    )
                 else:
                     valor = resultados[modelo_unico]["resumen"][clave]
                     st.metric(modelo_unico, formato_porcentaje(valor))
@@ -701,45 +739,48 @@ def renderizar_lectura_rapida(resultados, comparar, equipo_a, equipo_b, modelo_u
     st.markdown("### Lectura rápida")
 
     if comparar:
-        prob_a_poisson = resultados["Poisson + Elo"]["resumen"]["Gana equipo A"]
-        prob_a_xgb = resultados["XGBoost"]["resumen"]["Gana equipo A"]
-
-        if np.isclose(prob_a_poisson, prob_a_xgb, atol=0.05):
-            modelo_mas_a = "Ambos modelos dan prácticamente la misma probabilidad al Equipo A."
-        elif prob_a_poisson > prob_a_xgb:
-            modelo_mas_a = "Poisson + Elo favorece más al Equipo A."
-        else:
-            modelo_mas_a = "XGBoost favorece más al Equipo A."
-
-        favorito_poisson = obtener_favorito(resultados["Poisson + Elo"]["resumen"], equipo_a, equipo_b)
-        favorito_xgb = obtener_favorito(resultados["XGBoost"]["resumen"], equipo_a, equipo_b)
+        resumen_poisson = resultados["Poisson + Elo"]["resumen"]
+        resumen_xgb = resultados["XGBoost"]["resumen"]
+        favorito_poisson = obtener_favorito(resumen_poisson, equipo_a, equipo_b)
+        favorito_xgb = obtener_favorito(resumen_xgb, equipo_a, equipo_b)
         coinciden_favorito = favorito_poisson == favorito_xgb
+
+        prob_fav_poisson = probabilidad_favorito(resumen_poisson, favorito_poisson, equipo_a, equipo_b)
+        prob_fav_xgb = probabilidad_favorito(resumen_xgb, favorito_xgb, equipo_a, equipo_b)
+
+        if np.isclose(prob_fav_poisson, prob_fav_xgb, atol=0.05):
+            conservador = "Ambos modelos tienen una confianza muy similar en su favorito."
+        elif prob_fav_poisson < prob_fav_xgb:
+            conservador = "Poisson + Elo es más conservador con el favorito."
+        else:
+            conservador = "XGBoost es más conservador con el favorito."
 
         top_poisson = resultados["Poisson + Elo"]["marcadores"].head(10)["Marcador"].tolist()
         top_xgb = resultados["XGBoost"]["marcadores"].head(10)["Marcador"].tolist()
         coincidencias = [marcador for marcador in top_poisson if marcador in set(top_xgb)]
 
-        st.write(modelo_mas_a)
-        st.write(
-            "Ambos modelos coinciden en favorito: "
-            f"{'sí' if coinciden_favorito else 'no'} "
-            f"(Poisson + Elo: {favorito_poisson}; XGBoost: {favorito_xgb})."
-        )
-        st.write(
-            "Marcadores que coinciden en el top 10: "
-            f"{', '.join(coincidencias) if coincidencias else 'sin coincidencias entre los top 10'}."
+        st.markdown(
+            "\n".join([
+                f"- Favorito según Poisson + Elo: **{favorito_poisson}** ({prob_fav_poisson:.1f}%).",
+                f"- Favorito según XGBoost: **{favorito_xgb}** ({prob_fav_xgb:.1f}%).",
+                f"- Coincidencia de favorito: **{'sí' if coinciden_favorito else 'no'}**.",
+                f"- Modelo más conservador con el favorito: **{conservador}**",
+                "- Marcadores que aparecen en el top de ambos modelos: "
+                f"**{', '.join(coincidencias) if coincidencias else 'sin coincidencias entre los top 10'}**."
+            ])
         )
     else:
         resultado = resultados[modelo_unico]
         favorito = obtener_favorito(resultado["resumen"], equipo_a, equipo_b)
         marcador_principal = resultado["marcadores"].iloc[0]
 
-        st.write(f"El modelo favorece principalmente a: {favorito}.")
-        st.write(
-            f"Marcador más probable: {marcador_principal['Marcador']} "
-            f"({marcador_principal['Probabilidad']:.1f}%)."
+        st.markdown(
+            "\n".join([
+                f"- Favorito del modelo: **{favorito}**.",
+                f"- Marcador más probable: **{marcador_principal['Marcador']}** ({marcador_principal['Probabilidad']:.1f}%).",
+                "- La coincidencia entre modelos se muestra al elegir **Comparar ambos**."
+            ])
         )
-        st.write("La coincidencia entre modelos se muestra al elegir 'Comparar ambos'.")
 
 
 # ----------------------------
@@ -811,6 +852,14 @@ if calcular:
         ])
 
         with tab_resumen:
+            renderizar_lectura_rapida(
+                resultados,
+                comparar,
+                equipo_a,
+                equipo_b,
+                modelo_unico=modelo_elegido if not comparar else None
+            )
+
             renderizar_cards_principales(
                 resultados,
                 comparar,
@@ -826,14 +875,6 @@ if calcular:
                 modelo_unico=modelo_elegido if not comparar else None
             )
             st.dataframe(tabla_eventos, use_container_width=True, hide_index=True)
-
-            renderizar_lectura_rapida(
-                resultados,
-                comparar,
-                equipo_a,
-                equipo_b,
-                modelo_unico=modelo_elegido if not comparar else None
-            )
 
         with tab_marcadores:
             st.markdown("### Marcadores más probables")
@@ -856,6 +897,13 @@ if calcular:
                         use_container_width=True,
                         hide_index=True
                     )
+
+                st.markdown("#### Comparativa de marcadores")
+                st.dataframe(
+                    crear_tabla_marcadores_comparativa(resultados),
+                    use_container_width=True,
+                    hide_index=True
+                )
             else:
                 st.dataframe(
                     tabla_marcadores(resultados[modelo_elegido]["marcadores"]),
@@ -865,32 +913,43 @@ if calcular:
 
         with tab_matriz:
             if comparar:
-                col_poisson, col_xgb = st.columns(2)
+                max_goles_matriz = 5
+                vmax_matriz = max(
+                    float((resultados["Poisson + Elo"]["matriz"][:max_goles_matriz + 1, :max_goles_matriz + 1] * 100).max()),
+                    float((resultados["XGBoost"]["matriz"][:max_goles_matriz + 1, :max_goles_matriz + 1] * 100).max())
+                )
+                col_poisson, col_xgb = st.columns(2, gap="small")
 
                 with col_poisson:
                     st.markdown("#### Poisson + Elo")
                     fig_poisson = graficar_marcadores(
                         resultados["Poisson + Elo"]["matriz"],
                         equipo_a,
-                        equipo_b
+                        equipo_b,
+                        max_goles=max_goles_matriz,
+                        vmin=0,
+                        vmax=vmax_matriz
                     )
-                    st.pyplot(fig_poisson)
+                    st.pyplot(fig_poisson, use_container_width=False)
 
                 with col_xgb:
                     st.markdown("#### XGBoost")
                     fig_xgb = graficar_marcadores(
                         resultados["XGBoost"]["matriz"],
                         equipo_a,
-                        equipo_b
+                        equipo_b,
+                        max_goles=max_goles_matriz,
+                        vmin=0,
+                        vmax=vmax_matriz
                     )
-                    st.pyplot(fig_xgb)
+                    st.pyplot(fig_xgb, use_container_width=False)
             else:
                 fig = graficar_marcadores(
                     resultados[modelo_elegido]["matriz"],
                     equipo_a,
                     equipo_b
                 )
-                st.pyplot(fig)
+                st.pyplot(fig, use_container_width=False)
 
         with tab_detalles:
             filas_detalle = []
@@ -909,7 +968,7 @@ if calcular:
                 use_container_width=True,
                 hide_index=True
             )
-            st.caption("La columna Diferencia compara XGBoost menos Poisson + Elo, expresada en puntos porcentuales.")
+            st.caption("Diferencia = XGBoost menos Poisson + Elo, expresada en puntos porcentuales.")
 
 with st.expander("Notas importantes"):
     st.write(
