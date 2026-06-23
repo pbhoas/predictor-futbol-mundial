@@ -576,6 +576,172 @@ def graficar_marcadores(matriz, equipo_a, equipo_b, max_goles=5):
     return fig
 
 
+EVENTOS_COMPARACION = [
+    ("Gana Equipo A", "Gana equipo A"),
+    ("Empate", "Empate"),
+    ("Gana Equipo B", "Gana equipo B"),
+    ("Más de 1.5 goles", "Más de 1.5 goles"),
+    ("Más de 2.5 goles", "Más de 2.5 goles"),
+    ("Más de 3.5 goles", "Más de 3.5 goles"),
+    ("Ambos marcan", "Ambos marcan"),
+]
+
+
+def formato_porcentaje(valor):
+    return f"{valor:.1f}%"
+
+
+def formato_diferencia(valor):
+    return f"{valor:+.1f} pp"
+
+
+def calcular_modelo(modelo, equipo_a, equipo_b, fecha, neutral, tipo_partido):
+    if modelo == "Poisson + Elo":
+        goles_a, goles_b, elo_a, elo_b = predecir_goles_poisson_elo(
+            equipo_a,
+            equipo_b,
+            fecha,
+            neutral,
+            tipo_partido
+        )
+        extra = {
+            "Elo Equipo A": f"{elo_a:.0f}",
+            "Elo Equipo B": f"{elo_b:.0f}",
+            "Detalle": f"Elo: {equipo_a} {elo_a:.0f} | {equipo_b} {elo_b:.0f}"
+        }
+    else:
+        goles_a, goles_b, n_entrenamiento = predecir_goles_xgb(
+            equipo_a,
+            equipo_b,
+            fecha,
+            neutral,
+            tipo_partido
+        )
+        extra = {
+            "Partidos de entrenamiento": f"{n_entrenamiento:,}",
+            "Detalle": f"Partidos usados para entrenar: {n_entrenamiento:,}"
+        }
+
+    matriz, resumen, marcadores = calcular_probabilidades(goles_a, goles_b)
+
+    return {
+        "modelo": modelo,
+        "goles_a": goles_a,
+        "goles_b": goles_b,
+        "matriz": matriz,
+        "resumen": resumen,
+        "marcadores": marcadores,
+        "extra": extra,
+    }
+
+
+def crear_tabla_eventos(resultados, comparar, modelo_unico=None):
+    filas = []
+
+    for evento, clave in EVENTOS_COMPARACION:
+        if comparar:
+            poisson_elo = resultados["Poisson + Elo"]["resumen"][clave]
+            xgboost = resultados["XGBoost"]["resumen"][clave]
+            filas.append({
+                "Evento": evento,
+                "Poisson + Elo": formato_porcentaje(poisson_elo),
+                "XGBoost": formato_porcentaje(xgboost),
+                "Diferencia": formato_diferencia(xgboost - poisson_elo),
+            })
+        else:
+            valor = resultados[modelo_unico]["resumen"][clave]
+            filas.append({
+                "Evento": evento,
+                modelo_unico: formato_porcentaje(valor),
+            })
+
+    return pd.DataFrame(filas)
+
+
+def tabla_marcadores(marcadores):
+    tabla = marcadores.head(10).copy()
+    tabla["Probabilidad"] = tabla["Probabilidad"].map(formato_porcentaje)
+    return tabla
+
+
+def obtener_favorito(resumen, equipo_a, equipo_b):
+    opciones = {
+        equipo_a: resumen["Gana equipo A"],
+        "Empate": resumen["Empate"],
+        equipo_b: resumen["Gana equipo B"],
+    }
+    return max(opciones, key=opciones.get)
+
+
+def renderizar_cards_principales(resultados, comparar, equipo_a, equipo_b, modelo_unico=None):
+    eventos = [
+        (f"Gana {equipo_a}", "Gana equipo A"),
+        ("Empate", "Empate"),
+        (f"Gana {equipo_b}", "Gana equipo B"),
+    ]
+
+    columnas = st.columns(3)
+
+    for columna, (titulo, clave) in zip(columnas, eventos):
+        with columna:
+            with st.container(border=True):
+                st.markdown(f"**{titulo}**")
+                if comparar:
+                    poisson_elo = resultados["Poisson + Elo"]["resumen"][clave]
+                    xgboost = resultados["XGBoost"]["resumen"][clave]
+                    diferencia = xgboost - poisson_elo
+                    st.metric("Poisson + Elo", formato_porcentaje(poisson_elo))
+                    st.metric("XGBoost", formato_porcentaje(xgboost), delta=formato_diferencia(diferencia))
+                else:
+                    valor = resultados[modelo_unico]["resumen"][clave]
+                    st.metric(modelo_unico, formato_porcentaje(valor))
+
+
+def renderizar_lectura_rapida(resultados, comparar, equipo_a, equipo_b, modelo_unico=None):
+    st.markdown("### Lectura rápida")
+
+    if comparar:
+        prob_a_poisson = resultados["Poisson + Elo"]["resumen"]["Gana equipo A"]
+        prob_a_xgb = resultados["XGBoost"]["resumen"]["Gana equipo A"]
+
+        if np.isclose(prob_a_poisson, prob_a_xgb, atol=0.05):
+            modelo_mas_a = "Ambos modelos dan prácticamente la misma probabilidad al Equipo A."
+        elif prob_a_poisson > prob_a_xgb:
+            modelo_mas_a = "Poisson + Elo favorece más al Equipo A."
+        else:
+            modelo_mas_a = "XGBoost favorece más al Equipo A."
+
+        favorito_poisson = obtener_favorito(resultados["Poisson + Elo"]["resumen"], equipo_a, equipo_b)
+        favorito_xgb = obtener_favorito(resultados["XGBoost"]["resumen"], equipo_a, equipo_b)
+        coinciden_favorito = favorito_poisson == favorito_xgb
+
+        top_poisson = resultados["Poisson + Elo"]["marcadores"].head(10)["Marcador"].tolist()
+        top_xgb = resultados["XGBoost"]["marcadores"].head(10)["Marcador"].tolist()
+        coincidencias = [marcador for marcador in top_poisson if marcador in set(top_xgb)]
+
+        st.write(modelo_mas_a)
+        st.write(
+            "Ambos modelos coinciden en favorito: "
+            f"{'sí' if coinciden_favorito else 'no'} "
+            f"(Poisson + Elo: {favorito_poisson}; XGBoost: {favorito_xgb})."
+        )
+        st.write(
+            "Marcadores que coinciden en el top 10: "
+            f"{', '.join(coincidencias) if coincidencias else 'sin coincidencias entre los top 10'}."
+        )
+    else:
+        resultado = resultados[modelo_unico]
+        favorito = obtener_favorito(resultado["resumen"], equipo_a, equipo_b)
+        marcador_principal = resultado["marcadores"].iloc[0]
+
+        st.write(f"El modelo favorece principalmente a: {favorito}.")
+        st.write(
+            f"Marcador más probable: {marcador_principal['Marcador']} "
+            f"({marcador_principal['Probabilidad']:.1f}%)."
+        )
+        st.write("La coincidencia entre modelos se muestra al elegir 'Comparar ambos'.")
+
+
 # ----------------------------
 # Interfaz
 # ----------------------------
@@ -605,7 +771,11 @@ with col5:
     tipo_partido = st.selectbox("Tipo de partido", ["Mundial", "Oficial", "Amistoso"], index=0)
 
 with col6:
-    modelo_elegido = st.selectbox("Modelo", ["XGBoost", "Poisson + Elo"], index=0)
+    modelo_elegido = st.selectbox(
+        "Modelo",
+        ["Comparar ambos", "Poisson + Elo", "XGBoost"],
+        index=0
+    )
 
 calcular = st.button("Calcular pronóstico", type="primary")
 
@@ -613,62 +783,133 @@ if calcular:
     if equipo_a == equipo_b:
         st.error("Selecciona dos equipos diferentes.")
     else:
+        comparar = modelo_elegido == "Comparar ambos"
+        modelos = ["Poisson + Elo", "XGBoost"] if comparar else [modelo_elegido]
+
         with st.spinner("Calculando pronóstico..."):
-            if modelo_elegido == "Poisson + Elo":
-                goles_a, goles_b, elo_a, elo_b = predecir_goles_poisson_elo(
+            resultados = {
+                modelo: calcular_modelo(
+                    modelo,
                     equipo_a,
                     equipo_b,
                     fecha,
                     neutral,
                     tipo_partido
                 )
-                extra = f"Elo: {equipo_a} {elo_a:.0f} | {equipo_b} {elo_b:.0f}"
+                for modelo in modelos
+            }
+
+        sede = "cancha neutral" if neutral else "localía para Equipo A"
+        st.header(f"{equipo_a} vs {equipo_b}")
+        st.caption(f"{tipo_partido} | {sede} | {fecha.strftime('%d/%m/%Y')}")
+
+        tab_resumen, tab_marcadores, tab_matriz, tab_detalles = st.tabs([
+            "Resumen",
+            "Marcadores",
+            "Matriz de goles",
+            "Detalles técnicos"
+        ])
+
+        with tab_resumen:
+            renderizar_cards_principales(
+                resultados,
+                comparar,
+                equipo_a,
+                equipo_b,
+                modelo_unico=modelo_elegido if not comparar else None
+            )
+
+            st.markdown("### Tabla comparativa")
+            tabla_eventos = crear_tabla_eventos(
+                resultados,
+                comparar,
+                modelo_unico=modelo_elegido if not comparar else None
+            )
+            st.dataframe(tabla_eventos, use_container_width=True, hide_index=True)
+
+            renderizar_lectura_rapida(
+                resultados,
+                comparar,
+                equipo_a,
+                equipo_b,
+                modelo_unico=modelo_elegido if not comparar else None
+            )
+
+        with tab_marcadores:
+            st.markdown("### Marcadores más probables")
+
+            if comparar:
+                col_poisson, col_xgb = st.columns(2)
+
+                with col_poisson:
+                    st.markdown("#### Top marcadores Poisson + Elo")
+                    st.dataframe(
+                        tabla_marcadores(resultados["Poisson + Elo"]["marcadores"]),
+                        use_container_width=True,
+                        hide_index=True
+                    )
+
+                with col_xgb:
+                    st.markdown("#### Top marcadores XGBoost")
+                    st.dataframe(
+                        tabla_marcadores(resultados["XGBoost"]["marcadores"]),
+                        use_container_width=True,
+                        hide_index=True
+                    )
             else:
-                goles_a, goles_b, n_entrenamiento = predecir_goles_xgb(
-                    equipo_a,
-                    equipo_b,
-                    fecha,
-                    neutral,
-                    tipo_partido
+                st.dataframe(
+                    tabla_marcadores(resultados[modelo_elegido]["marcadores"]),
+                    use_container_width=True,
+                    hide_index=True
                 )
-                extra = f"Partidos usados para entrenar: {n_entrenamiento}"
 
-            matriz, resumen, marcadores = calcular_probabilidades(goles_a, goles_b)
+        with tab_matriz:
+            if comparar:
+                col_poisson, col_xgb = st.columns(2)
 
-        st.subheader(f"{equipo_a} vs {equipo_b}")
-        st.write(f"**Modelo:** {modelo_elegido}")
-        st.write(extra)
-        st.write(f"**Goles esperados:** {equipo_a} {goles_a:.2f} | {equipo_b} {goles_b:.2f}")
+                with col_poisson:
+                    st.markdown("#### Poisson + Elo")
+                    fig_poisson = graficar_marcadores(
+                        resultados["Poisson + Elo"]["matriz"],
+                        equipo_a,
+                        equipo_b
+                    )
+                    st.pyplot(fig_poisson)
 
-        c1, c2, c3 = st.columns(3)
-        c1.metric(f"Gana {equipo_a}", f"{resumen['Gana equipo A']:.1f}%")
-        c2.metric("Empate", f"{resumen['Empate']:.1f}%")
-        c3.metric(f"Gana {equipo_b}", f"{resumen['Gana equipo B']:.1f}%")
+                with col_xgb:
+                    st.markdown("#### XGBoost")
+                    fig_xgb = graficar_marcadores(
+                        resultados["XGBoost"]["matriz"],
+                        equipo_a,
+                        equipo_b
+                    )
+                    st.pyplot(fig_xgb)
+            else:
+                fig = graficar_marcadores(
+                    resultados[modelo_elegido]["matriz"],
+                    equipo_a,
+                    equipo_b
+                )
+                st.pyplot(fig)
 
-        st.markdown("### Mercados principales")
+        with tab_detalles:
+            filas_detalle = []
 
-        tabla_eventos = pd.DataFrame([
-            ["Más de 1.5 goles", resumen["Más de 1.5 goles"]],
-            ["Menos de 1.5 goles", resumen["Menos de 1.5 goles"]],
-            ["Más de 2.5 goles", resumen["Más de 2.5 goles"]],
-            ["Menos de 2.5 goles", resumen["Menos de 2.5 goles"]],
-            ["Más de 3.5 goles", resumen["Más de 3.5 goles"]],
-            ["Menos de 3.5 goles", resumen["Menos de 3.5 goles"]],
-            ["Ambos marcan", resumen["Ambos marcan"]],
-            ["No marcan ambos", resumen["No marcan ambos"]],
-        ], columns=["Evento", "Probabilidad"])
+            for modelo, resultado in resultados.items():
+                fila = {
+                    "Modelo": modelo,
+                    f"Goles esperados {equipo_a}": f"{resultado['goles_a']:.2f}",
+                    f"Goles esperados {equipo_b}": f"{resultado['goles_b']:.2f}",
+                    "Detalle": resultado["extra"]["Detalle"],
+                }
+                filas_detalle.append(fila)
 
-        tabla_eventos["Probabilidad"] = tabla_eventos["Probabilidad"].map(lambda x: f"{x:.1f}%")
-        st.dataframe(tabla_eventos, use_container_width=True, hide_index=True)
-
-        st.markdown("### 10 marcadores más probables")
-        tabla_marcadores = marcadores.head(10).copy()
-        tabla_marcadores["Probabilidad"] = tabla_marcadores["Probabilidad"].round(1).astype(str) + "%"
-        st.dataframe(tabla_marcadores, use_container_width=True, hide_index=True)
-
-        st.markdown("### Matriz de marcadores")
-        fig = graficar_marcadores(matriz, equipo_a, equipo_b)
-        st.pyplot(fig)
+            st.dataframe(
+                pd.DataFrame(filas_detalle),
+                use_container_width=True,
+                hide_index=True
+            )
+            st.caption("La columna Diferencia compara XGBoost menos Poisson + Elo, expresada en puntos porcentuales.")
 
 with st.expander("Notas importantes"):
     st.write(
