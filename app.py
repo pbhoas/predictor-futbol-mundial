@@ -597,6 +597,13 @@ ESTADOS_COMPETITIVOS = [
 ]
 
 RIESGOS_ROTACION = ["Bajo", "Medio", "Alto"]
+FORMAS_TORNEO = [
+    "Sin ajuste",
+    "Mejor de lo esperado",
+    "Mucho mejor de lo esperado",
+    "Peor de lo esperado",
+    "Mucho peor de lo esperado",
+]
 RESULTADO_KEYS = ["Gana equipo A", "Empate", "Gana equipo B"]
 
 
@@ -648,48 +655,186 @@ def calcular_modelo(modelo, equipo_a, equipo_b, fecha, neutral, tipo_partido):
     }
 
 
-def crear_tabla_eventos(resultados, ajustes_contexto=None, comparar=False, modelo_unico=None):
+def limitar_goles(valor):
+    return float(np.clip(valor, 0.15, 5.50))
+
+
+def factor_forma_reciente(forma, partidos_considerados):
+    ajustes_base = {
+        "Sin ajuste": 0.00,
+        "Mejor de lo esperado": 0.04,
+        "Mucho mejor de lo esperado": 0.08,
+        "Peor de lo esperado": -0.04,
+        "Mucho peor de lo esperado": -0.08,
+    }
+    escalas = {0: 0.00, 1: 0.50, 2: 0.75, 3: 1.00}
+    return ajustes_base[forma] * escalas[int(partidos_considerados)]
+
+
+def texto_porcentaje_factor(valor):
+    return f"{valor * 100:.1f}%"
+
+
+def aplicar_reglas_equipo_goles(factores, contexto, lado, reglas):
+    estado = contexto[f"estado_{lado}"]
+    rotacion = contexto[f"rotacion_{lado}"]
+    diferencia = contexto[f"diferencia_{lado}"]
+    equipo = "Equipo A" if lado == "a" else "Equipo B"
+    rival = "b" if lado == "a" else "a"
+
+    if estado == "Necesita ganar":
+        factores[lado] += 0.05
+        factores[rival] += 0.025
+        reglas.append(
+            f"{equipo} necesita ganar: se aumentaron sus goles esperados 5.0% y los del rival 2.5% por mayor exposición."
+        )
+
+    elif estado == "Le sirve empatar":
+        factores[lado] -= 0.045
+        reglas.append(
+            f"{equipo} le sirve empatar: se redujeron sus goles esperados 4.5% para reflejar menor ritmo/agresividad."
+        )
+
+    elif estado == "Necesita ganar por diferencia de goles":
+        ajuste_propio = min(0.08 + diferencia * 0.012, 0.15)
+        ajuste_rival = min(0.04 + diferencia * 0.007, 0.08)
+        factores[lado] += ajuste_propio
+        factores[rival] += ajuste_rival
+        extra = f" con objetivo de {diferencia} goles" if diferencia > 0 else ""
+        reglas.append(
+            f"{equipo} necesita ganar por diferencia{extra}: se aumentaron sus goles esperados {texto_porcentaje_factor(ajuste_propio)} y los del rival {texto_porcentaje_factor(ajuste_rival)} por exposición defensiva."
+        )
+
+    elif estado == "Ya clasificado":
+        if rotacion == "Medio":
+            factores[lado] -= 0.04
+            factores[rival] += 0.02
+            reglas.append(
+                f"{equipo} ya clasificado con rotación media: se redujeron sus goles esperados 4.0% y se elevó 2.0% la expectativa del rival."
+            )
+        elif rotacion == "Alto":
+            factores[lado] -= 0.08
+            factores[rival] += 0.04
+            reglas.append(
+                f"{equipo} ya clasificado con rotación alta: se redujeron sus goles esperados 8.0% y se elevó 4.0% la expectativa del rival."
+            )
+        else:
+            reglas.append(
+                f"{equipo} ya clasificado con rotación baja: no se cambió su expectativa de goles, solo se marca cautela interpretativa."
+            )
+
+    elif estado == "Ya eliminado":
+        if rotacion == "Alto":
+            factores[lado] -= 0.05
+            reglas.append(
+                f"{equipo} ya eliminado con rotación alta: se redujeron sus goles esperados 5.0%, sin asumir caída automática por eliminación."
+            )
+        elif rotacion in ["Bajo", "Medio"]:
+            reglas.append(
+                f"{equipo} ya eliminado con rotación {rotacion.lower()}: no se penalizó automáticamente su rendimiento."
+            )
+
+
+def aplicar_forma_reciente_goles(factores, contexto, lado, reglas):
+    forma = contexto[f"forma_{lado}"]
+    partidos = int(contexto["partidos_forma"])
+    equipo = "Equipo A" if lado == "a" else "Equipo B"
+    ajuste = factor_forma_reciente(forma, partidos)
+
+    if partidos == 0:
+        if forma != "Sin ajuste":
+            reglas.append(
+                f"{equipo} tiene forma reciente marcada como '{forma}', pero con 0 partidos considerados no se aplicó ajuste."
+            )
+        return
+
+    if np.isclose(ajuste, 0.0):
+        return
+
+    factores[lado] += ajuste
+    direccion = "aumentó" if ajuste > 0 else "redujo"
+    reglas.append(
+        f"{equipo} viene rindiendo {forma.lower()} en el torneo: se {direccion} su expectativa ofensiva {abs(ajuste) * 100:.1f}% según {partidos} partido(s) considerados."
+    )
+
+
+def aplicar_ajuste_contexto_goles(goles_a, goles_b, contexto):
+    factores = {"a": 1.0, "b": 1.0}
+    reglas = []
+
+    aplicar_reglas_equipo_goles(factores, contexto, "a", reglas)
+    aplicar_reglas_equipo_goles(factores, contexto, "b", reglas)
+    aplicar_forma_reciente_goles(factores, contexto, "a", reglas)
+    aplicar_forma_reciente_goles(factores, contexto, "b", reglas)
+
+    if estado_obliga_a_atacar(contexto["estado_a"]) and estado_obliga_a_atacar(contexto["estado_b"]):
+        factores["a"] += 0.02
+        factores["b"] += 0.02
+        reglas.append(
+            "Ambos equipos están obligados a atacar: se añadió 2.0% a cada expectativa de gol por perfil de partido abierto."
+        )
+
+    goles_a_ajustado = limitar_goles(goles_a * max(0.20, factores["a"]))
+    goles_b_ajustado = limitar_goles(goles_b * max(0.20, factores["b"]))
+
+    if not reglas:
+        reglas.append("Sin ajuste contextual ni de forma aplicado: se mantienen los goles esperados base.")
+
+    return goles_a_ajustado, goles_b_ajustado, reglas
+
+
+def aplicar_ajuste_contexto(resultado_modelo, contexto):
+    goles_a, goles_b, reglas = aplicar_ajuste_contexto_goles(
+        resultado_modelo["goles_a"],
+        resultado_modelo["goles_b"],
+        contexto
+    )
+    matriz, resumen, marcadores = calcular_probabilidades(goles_a, goles_b)
+
+    return {
+        "goles_a": goles_a,
+        "goles_b": goles_b,
+        "matriz": matriz,
+        "resumen": resumen,
+        "marcadores": marcadores,
+        "reglas": reglas,
+    }
+
+
+def crear_resultados_ajustados(resultados, contexto):
+    return {
+        modelo: aplicar_ajuste_contexto(resultado, contexto)
+        for modelo, resultado in resultados.items()
+    }
+
+
+def crear_tabla_cambio_contexto(resultados, ajustes_contexto, comparar=False, modelo_unico=None):
     filas = []
 
     for evento, clave in EVENTOS_COMPARACION:
         if comparar:
             poisson_base = resultados["Poisson + Elo"]["resumen"][clave]
+            poisson_ajustado = ajustes_contexto["Poisson + Elo"]["resumen"][clave]
             xgb_base = resultados["XGBoost"]["resumen"][clave]
-
-            if ajustes_contexto:
-                poisson_ajustado = ajustes_contexto["Poisson + Elo"]["resumen"][clave]
-                xgb_ajustado = ajustes_contexto["XGBoost"]["resumen"][clave]
-                filas.append({
-                    "Evento": evento,
-                    "Poisson + Elo base": formato_porcentaje(poisson_base),
-                    "Poisson + Elo ajustado": formato_porcentaje(poisson_ajustado),
-                    "XGBoost base": formato_porcentaje(xgb_base),
-                    "XGBoost ajustado": formato_porcentaje(xgb_ajustado),
-                    "Diferencia ajustada": formato_diferencia(xgb_ajustado - poisson_ajustado),
-                })
-            else:
-                filas.append({
-                    "Evento": evento,
-                    "Poisson + Elo": formato_porcentaje(poisson_base),
-                    "XGBoost": formato_porcentaje(xgb_base),
-                    "Diferencia": formato_diferencia(xgb_base - poisson_base),
-                })
+            xgb_ajustado = ajustes_contexto["XGBoost"]["resumen"][clave]
+            filas.append({
+                "Evento": evento,
+                "Poisson + Elo base": formato_porcentaje(poisson_base),
+                "Poisson + Elo ajustado": formato_porcentaje(poisson_ajustado),
+                "Cambio Poisson": formato_diferencia(poisson_ajustado - poisson_base),
+                "XGBoost base": formato_porcentaje(xgb_base),
+                "XGBoost ajustado": formato_porcentaje(xgb_ajustado),
+                "Cambio XGBoost": formato_diferencia(xgb_ajustado - xgb_base),
+            })
         else:
-            valor = resultados[modelo_unico]["resumen"][clave]
-
-            if ajustes_contexto:
-                ajustado = ajustes_contexto[modelo_unico]["resumen"][clave]
-                filas.append({
-                    "Evento": evento,
-                    f"{modelo_unico} base": formato_porcentaje(valor),
-                    f"{modelo_unico} ajustado": formato_porcentaje(ajustado),
-                    "Diferencia ajuste": formato_diferencia(ajustado - valor),
-                })
-            else:
-                filas.append({
-                    "Evento": evento,
-                    modelo_unico: formato_porcentaje(valor),
-                })
+            base = resultados[modelo_unico]["resumen"][clave]
+            ajustado = ajustes_contexto[modelo_unico]["resumen"][clave]
+            filas.append({
+                "Evento": evento,
+                f"{modelo_unico} base": formato_porcentaje(base),
+                f"{modelo_unico} ajustado": formato_porcentaje(ajustado),
+                "Cambio": formato_diferencia(ajustado - base),
+            })
 
     return pd.DataFrame(filas)
 
@@ -700,23 +845,48 @@ def tabla_marcadores(marcadores):
     return tabla
 
 
-def crear_tabla_marcadores_comparativa(resultados, limite=12):
-    poisson = resultados["Poisson + Elo"]["marcadores"][["Marcador", "Probabilidad"]].rename(
-        columns={"Probabilidad": "Poisson + Elo"}
-    )
-    xgboost = resultados["XGBoost"]["marcadores"][["Marcador", "Probabilidad"]].rename(
-        columns={"Probabilidad": "XGBoost"}
-    )
+def crear_tabla_marcadores_base_ajustada(resultados, ajustes_contexto, comparar, modelo_unico=None, limite=15):
+    if comparar:
+        columnas = []
+        for modelo in ["Poisson + Elo", "XGBoost"]:
+            base = resultados[modelo]["marcadores"][["Marcador", "Probabilidad"]].rename(
+                columns={"Probabilidad": f"{modelo} base"}
+            )
+            ajustada = ajustes_contexto[modelo]["marcadores"][["Marcador", "Probabilidad"]].rename(
+                columns={"Probabilidad": f"{modelo} ajustado"}
+            )
+            columnas.extend([base, ajustada])
 
-    tabla = poisson.merge(xgboost, on="Marcador", how="outer").fillna(0)
-    tabla["Relevancia"] = tabla["Poisson + Elo"] + tabla["XGBoost"]
-    tabla["Diferencia"] = tabla["XGBoost"] - tabla["Poisson + Elo"]
-    tabla = tabla.sort_values("Relevancia", ascending=False).head(limite)
+        tabla = columnas[0]
+        for columna in columnas[1:]:
+            tabla = tabla.merge(columna, on="Marcador", how="outer")
+        tabla = tabla.fillna(0)
+        columnas_probabilidad = [col for col in tabla.columns if col != "Marcador"]
+        tabla["Relevancia"] = tabla[columnas_probabilidad].sum(axis=1)
+        tabla = tabla.sort_values("Relevancia", ascending=False).head(limite)
+        tabla = tabla[[
+            "Marcador",
+            "Poisson + Elo base",
+            "Poisson + Elo ajustado",
+            "XGBoost base",
+            "XGBoost ajustado",
+        ]].copy()
+    else:
+        base = resultados[modelo_unico]["marcadores"][["Marcador", "Probabilidad"]].rename(
+            columns={"Probabilidad": f"{modelo_unico} base"}
+        )
+        ajustada = ajustes_contexto[modelo_unico]["marcadores"][["Marcador", "Probabilidad"]].rename(
+            columns={"Probabilidad": f"{modelo_unico} ajustado"}
+        )
+        tabla = base.merge(ajustada, on="Marcador", how="outer").fillna(0)
+        columnas_probabilidad = [f"{modelo_unico} base", f"{modelo_unico} ajustado"]
+        tabla["Relevancia"] = tabla[columnas_probabilidad].sum(axis=1)
+        tabla = tabla.sort_values("Relevancia", ascending=False).head(limite)
+        tabla = tabla[["Marcador", f"{modelo_unico} base", f"{modelo_unico} ajustado"]].copy()
 
-    tabla = tabla[["Marcador", "Poisson + Elo", "XGBoost", "Diferencia"]].copy()
-    tabla["Poisson + Elo"] = tabla["Poisson + Elo"].map(formato_porcentaje)
-    tabla["XGBoost"] = tabla["XGBoost"].map(formato_porcentaje)
-    tabla["Diferencia"] = tabla["Diferencia"].map(formato_diferencia)
+    for columna in tabla.columns:
+        if columna != "Marcador":
+            tabla[columna] = tabla[columna].map(formato_porcentaje)
 
     return tabla
 
@@ -738,204 +908,33 @@ def probabilidad_favorito(resumen, favorito, equipo_a, equipo_b):
     return resumen["Empate"]
 
 
-def limitar_probabilidad(valor):
-    return float(np.clip(valor, 0, 100))
+def cambio_principal_resultado(resultado_base, resultado_ajustado):
+    cambios = {
+        clave: resultado_ajustado["resumen"][clave] - resultado_base["resumen"][clave]
+        for clave in RESULTADO_KEYS
+    }
+    clave_principal = max(cambios, key=lambda clave: abs(cambios[clave]))
+    return clave_principal, cambios[clave_principal]
 
 
-def normalizar_resultado(resumen):
-    valores = {clave: max(0, float(resumen[clave])) for clave in RESULTADO_KEYS}
-    total = sum(valores.values())
-
-    if total <= 0:
-        for clave in RESULTADO_KEYS:
-            resumen[clave] = 100 / 3
-        return resumen
-
-    for clave in RESULTADO_KEYS:
-        resumen[clave] = valores[clave] * 100 / total
-
-    return resumen
+def estado_obliga_a_atacar(estado):
+    return estado in ["Necesita ganar", "Necesita ganar por diferencia de goles"]
 
 
-def ajustar_mercado(resumen, clave, delta):
-    resumen[clave] = limitar_probabilidad(resumen[clave] + delta)
-
-
-def actualizar_complementos_mercados(resumen):
-    pares = [
-        ("Más de 1.5 goles", "Menos de 1.5 goles"),
-        ("Más de 2.5 goles", "Menos de 2.5 goles"),
-        ("Más de 3.5 goles", "Menos de 3.5 goles"),
-        ("Ambos marcan", "No marcan ambos"),
-    ]
-
-    for clave_mas, clave_menos in pares:
-        if clave_mas in resumen and clave_menos in resumen:
-            resumen[clave_mas] = limitar_probabilidad(resumen[clave_mas])
-            resumen[clave_menos] = limitar_probabilidad(100 - resumen[clave_mas])
-
-    return resumen
-
-
-def aplicar_deltas_equipo(resumen, contexto, lado, reglas):
-    estado = contexto[f"estado_{lado}"]
-    rotacion = contexto[f"rotacion_{lado}"]
-    diferencia = contexto[f"diferencia_{lado}"]
-
-    if lado == "a":
-        win_key = "Gana equipo A"
-        rival_key = "Gana equipo B"
-        nombre = "Equipo A"
-    else:
-        win_key = "Gana equipo B"
-        rival_key = "Gana equipo A"
-        nombre = "Equipo B"
-
-    if estado == "Necesita ganar":
-        delta_victoria = 3 if resumen[win_key] >= 25 else 2
-        resumen[win_key] += delta_victoria
-        resumen["Empate"] -= 1
-        resumen[rival_key] -= max(1, delta_victoria - 1)
-        ajustar_mercado(resumen, "Más de 1.5 goles", 1.5)
-        ajustar_mercado(resumen, "Más de 2.5 goles", 1.2)
-        ajustar_mercado(resumen, "Ambos marcan", 1.3)
-        reglas.append(
-            f"{nombre} necesita ganar: se incrementó agresividad ofensiva, victoria propia y mercados de goles."
-        )
-
-    elif estado == "Le sirve empatar":
-        resumen["Empate"] += 3
-        resumen[win_key] -= 1.5
-        rival_obligado = estado_obliga_a_atacar(contexto["estado_b" if lado == "a" else "estado_a"])
-        if not rival_obligado:
-            ajustar_mercado(resumen, "Más de 2.5 goles", -1.5)
-        reglas.append(
-            f"{nombre} le sirve empatar: se elevó el empate y se redujo ligeramente su perfil agresivo."
-        )
-
-    elif estado == "Necesita ganar por diferencia de goles":
-        resumen[win_key] += 2 if resumen[win_key] >= 20 else 1
-        resumen["Empate"] -= 1
-        ajustar_mercado(resumen, "Más de 2.5 goles", 3)
-        ajustar_mercado(resumen, "Más de 3.5 goles", 2.5)
-        ajustar_mercado(resumen, "Ambos marcan", 2.5)
-        extra = f" con objetivo de {diferencia} goles" if diferencia > 0 else ""
-        reglas.append(
-            f"{nombre} necesita ganar por diferencia{extra}: se abrió el partido y aumentó la dispersión esperada."
-        )
-
-    elif estado == "Ya clasificado":
-        if rotacion == "Medio":
-            resumen[win_key] -= 2
-            resumen["Empate"] += 1
-            resumen[rival_key] += 1
-            reglas.append(
-                f"{nombre} ya clasificado con rotación media: se redujo su fuerza esperada en 2 pp."
-            )
-        elif rotacion == "Alto":
-            resumen[win_key] -= 4
-            resumen["Empate"] += 1.5
-            resumen[rival_key] += 2.5
-            reglas.append(
-                f"{nombre} ya clasificado con rotación alta: se redujo su fuerza esperada en 4 pp y subió la incertidumbre."
-            )
-        else:
-            reglas.append(
-                f"{nombre} ya clasificado con rotación baja: se mantuvo casi igual y solo se marca cautela interpretativa."
-            )
-
-    elif estado == "Ya eliminado":
-        if rotacion == "Alto":
-            resumen[win_key] -= 2
-            resumen["Empate"] += 0.8
-            resumen[rival_key] += 1.2
-            reglas.append(
-                f"{nombre} ya eliminado con rotación alta: se redujo ligeramente su expectativa, sin asumir caída automática."
-            )
-        elif rotacion == "Bajo":
-            reglas.append(
-                f"{nombre} ya eliminado con rotación baja: no se penalizó automáticamente su rendimiento."
-            )
-        else:
-            resumen[win_key] -= 1
-            resumen["Empate"] += 0.5
-            resumen[rival_key] += 0.5
-            reglas.append(
-                f"{nombre} ya eliminado con rotación media: se aplicó una reducción mínima por incertidumbre."
-            )
-
-
-def aplicar_ajuste_contexto(resultado_modelo, contexto):
-    resumen = resultado_modelo["resumen"].copy()
+def reglas_unicas(ajustes_contexto):
     reglas = []
-
-    aplicar_deltas_equipo(resumen, contexto, "a", reglas)
-    aplicar_deltas_equipo(resumen, contexto, "b", reglas)
-
-    if estado_obliga_a_atacar(contexto["estado_a"]) and estado_obliga_a_atacar(contexto["estado_b"]):
-        resumen["Empate"] -= 1
-        ajustar_mercado(resumen, "Más de 1.5 goles", 1.5)
-        ajustar_mercado(resumen, "Más de 2.5 goles", 1.8)
-        ajustar_mercado(resumen, "Ambos marcan", 2)
-        reglas.append(
-            "Ambos equipos están obligados a atacar: se elevó la incertidumbre y el perfil de partido abierto."
-        )
-
-    resumen = normalizar_resultado(resumen)
-    resumen = actualizar_complementos_mercados(resumen)
-
-    if not reglas:
-        reglas.append("Sin ajuste contextual aplicado: se mantienen las probabilidades base.")
-
-    return {
-        "resumen": resumen,
-        "reglas": reglas,
-    }
+    for ajuste in ajustes_contexto.values():
+        for regla in ajuste["reglas"]:
+            if regla not in reglas:
+                reglas.append(regla)
+    return reglas
 
 
-def crear_resultados_ajustados(resultados, contexto):
-    return {
-        modelo: aplicar_ajuste_contexto(resultado, contexto)
-        for modelo, resultado in resultados.items()
-    }
-
-
-def renderizar_cards_principales(resultados, comparar, equipo_a, equipo_b, modelo_unico=None):
-    eventos = [
-        (f"Gana {equipo_a}", "Gana equipo A"),
-        ("Empate", "Empate"),
-        (f"Gana {equipo_b}", "Gana equipo B"),
-    ]
-
-    columnas = st.columns(3, gap="small")
-
-    for columna, (titulo, clave) in zip(columnas, eventos):
-        with columna:
-            with st.container(border=True):
-                st.markdown(f"**{titulo}**")
-                if comparar:
-                    poisson_elo = resultados["Poisson + Elo"]["resumen"][clave]
-                    xgboost = resultados["XGBoost"]["resumen"][clave]
-                    diferencia = xgboost - poisson_elo
-
-                    c_poisson, c_xgb = st.columns(2, gap="small")
-                    c_poisson.metric("Poisson + Elo", formato_porcentaje(poisson_elo))
-                    c_xgb.metric("XGBoost", formato_porcentaje(xgboost))
-                    st.metric(
-                        "Diferencia XGBoost - Poisson + Elo",
-                        formato_diferencia(diferencia),
-                        delta=formato_diferencia(diferencia),
-                        delta_color="normal"
-                    )
-                else:
-                    valor = resultados[modelo_unico]["resumen"][clave]
-                    st.metric(modelo_unico, formato_porcentaje(valor))
-
-
-def renderizar_cards_ajustadas(resultados, ajustes_contexto, comparar, equipo_a, equipo_b, modelo_unico=None):
-    st.markdown("### Probabilidades ajustadas por contexto")
+def renderizar_cards_resultado(resultados, ajustes_contexto, comparar, equipo_a, equipo_b, modelo_unico=None):
+    st.markdown("### Probabilidades base y ajustadas por contexto")
     st.caption(
-        "El ajuste por contexto es una capa heurística sobre el modelo base; no reemplaza el modelo estadístico."
+        "El ajuste por contexto competitivo y forma reciente es una capa heurística sobre el modelo base; "
+        "no reemplaza el modelo estadístico ni está entrenado con datos históricos de contexto."
     )
 
     eventos = [
@@ -953,24 +952,26 @@ def renderizar_cards_ajustadas(resultados, ajustes_contexto, comparar, equipo_a,
                 for modelo in modelos:
                     base = resultados[modelo]["resumen"][clave]
                     ajustado = ajustes_contexto[modelo]["resumen"][clave]
-                    diferencia = ajustado - base
+                    cambio = ajustado - base
                     st.markdown(f"**{modelo}**")
-                    col_base, col_ajustado = st.columns(2, gap="small")
+                    col_base, col_ajustada, col_cambio = st.columns(3, gap="small")
                     col_base.metric("Base", formato_porcentaje(base))
-                    col_ajustado.metric(
-                        "Ajustada",
-                        formato_porcentaje(ajustado),
-                        delta=formato_diferencia(diferencia),
+                    col_ajustada.metric("Ajustado", formato_porcentaje(ajustado))
+                    col_cambio.metric(
+                        "Cambio",
+                        formato_diferencia(cambio),
+                        delta=formato_diferencia(cambio),
                         delta_color="normal"
                     )
 
 
-def renderizar_lectura_rapida(resultados, comparar, equipo_a, equipo_b, modelo_unico=None):
+def renderizar_lectura_rapida(resultados, ajustes_contexto, comparar, equipo_a, equipo_b, modelo_unico=None):
     st.markdown("### Lectura rápida")
+    st.caption("Prioriza el escenario ajustado; el escenario base queda como referencia estadística sin contexto.")
 
     if comparar:
-        resumen_poisson = resultados["Poisson + Elo"]["resumen"]
-        resumen_xgb = resultados["XGBoost"]["resumen"]
+        resumen_poisson = ajustes_contexto["Poisson + Elo"]["resumen"]
+        resumen_xgb = ajustes_contexto["XGBoost"]["resumen"]
         favorito_poisson = obtener_favorito(resumen_poisson, equipo_a, equipo_b)
         favorito_xgb = obtener_favorito(resumen_xgb, equipo_a, equipo_b)
         coinciden_favorito = favorito_poisson == favorito_xgb
@@ -979,51 +980,48 @@ def renderizar_lectura_rapida(resultados, comparar, equipo_a, equipo_b, modelo_u
         prob_fav_xgb = probabilidad_favorito(resumen_xgb, favorito_xgb, equipo_a, equipo_b)
 
         if np.isclose(prob_fav_poisson, prob_fav_xgb, atol=0.05):
-            conservador = "Ambos modelos tienen una confianza muy similar en su favorito."
+            conservador = "Ambos modelos tienen una confianza muy similar en su favorito ajustado."
         elif prob_fav_poisson < prob_fav_xgb:
-            conservador = "Poisson + Elo es más conservador con el favorito."
+            conservador = "Poisson + Elo es más conservador con el favorito ajustado."
         else:
-            conservador = "XGBoost es más conservador con el favorito."
+            conservador = "XGBoost es más conservador con el favorito ajustado."
 
-        top_poisson = resultados["Poisson + Elo"]["marcadores"].head(10)["Marcador"].tolist()
-        top_xgb = resultados["XGBoost"]["marcadores"].head(10)["Marcador"].tolist()
+        top_poisson = ajustes_contexto["Poisson + Elo"]["marcadores"].head(10)["Marcador"].tolist()
+        top_xgb = ajustes_contexto["XGBoost"]["marcadores"].head(10)["Marcador"].tolist()
         coincidencias = [marcador for marcador in top_poisson if marcador in set(top_xgb)]
+
+        cambio_poisson = cambio_principal_resultado(resultados["Poisson + Elo"], ajustes_contexto["Poisson + Elo"])
+        cambio_xgb = cambio_principal_resultado(resultados["XGBoost"], ajustes_contexto["XGBoost"])
 
         st.markdown(
             "\n".join([
-                f"- Favorito según Poisson + Elo: **{favorito_poisson}** ({prob_fav_poisson:.1f}%).",
-                f"- Favorito según XGBoost: **{favorito_xgb}** ({prob_fav_xgb:.1f}%).",
-                f"- Coincidencia de favorito: **{'sí' if coinciden_favorito else 'no'}**.",
+                f"- Favorito ajustado según Poisson + Elo: **{favorito_poisson}** ({prob_fav_poisson:.1f}%).",
+                f"- Favorito ajustado según XGBoost: **{favorito_xgb}** ({prob_fav_xgb:.1f}%).",
+                f"- Coincidencia de favorito ajustado: **{'sí' if coinciden_favorito else 'no'}**.",
                 f"- Modelo más conservador con el favorito: **{conservador}**",
-                "- Marcadores que aparecen en el top de ambos modelos: "
+                "- Mayor cambio por contexto: "
+                f"Poisson + Elo mueve **{cambio_poisson[0]}** ({formato_diferencia(cambio_poisson[1])}); "
+                f"XGBoost mueve **{cambio_xgb[0]}** ({formato_diferencia(cambio_xgb[1])}).",
+                "- Marcadores ajustados que aparecen en el top de ambos modelos: "
                 f"**{', '.join(coincidencias) if coincidencias else 'sin coincidencias entre los top 10'}**."
             ])
         )
     else:
-        resultado = resultados[modelo_unico]
-        favorito = obtener_favorito(resultado["resumen"], equipo_a, equipo_b)
-        marcador_principal = resultado["marcadores"].iloc[0]
+        base = resultados[modelo_unico]
+        ajustado = ajustes_contexto[modelo_unico]
+        favorito_base = obtener_favorito(base["resumen"], equipo_a, equipo_b)
+        favorito_ajustado = obtener_favorito(ajustado["resumen"], equipo_a, equipo_b)
+        marcador_principal = ajustado["marcadores"].iloc[0]
+        cambio = cambio_principal_resultado(base, ajustado)
 
         st.markdown(
             "\n".join([
-                f"- Favorito del modelo: **{favorito}**.",
-                f"- Marcador más probable: **{marcador_principal['Marcador']}** ({marcador_principal['Probabilidad']:.1f}%).",
-                "- La coincidencia entre modelos se muestra al elegir **Comparar ambos**."
+                f"- Favorito base: **{favorito_base}**.",
+                f"- Favorito ajustado por contexto y forma: **{favorito_ajustado}**.",
+                f"- Mayor cambio por contexto: **{cambio[0]}** ({formato_diferencia(cambio[1])}).",
+                f"- Marcador ajustado más probable: **{marcador_principal['Marcador']}** ({marcador_principal['Probabilidad']:.1f}%).",
             ])
         )
-
-
-def estado_obliga_a_atacar(estado):
-    return estado in ["Necesita ganar", "Necesita ganar por diferencia de goles"]
-
-
-def reglas_unicas(ajustes_contexto):
-    reglas = []
-    for ajuste in ajustes_contexto.values():
-        for regla in ajuste["reglas"]:
-            if regla not in reglas:
-                reglas.append(regla)
-    return reglas
 
 
 def renderizar_lectura_estrategica(contexto, equipo_a, equipo_b, ajustes_contexto=None):
@@ -1035,16 +1033,20 @@ def renderizar_lectura_estrategica(contexto, equipo_a, equipo_b, ajustes_context
     rotacion_b = contexto["rotacion_b"]
     diferencia_a = contexto["diferencia_a"]
     diferencia_b = contexto["diferencia_b"]
+    forma_a = contexto["forma_a"]
+    forma_b = contexto["forma_b"]
+    partidos_forma = contexto["partidos_forma"]
 
     contexto_normal = estado_a == "Normal" and estado_b == "Normal"
     rotacion_baja = rotacion_a == "Bajo" and rotacion_b == "Bajo"
+    sin_forma = partidos_forma == 0 or (forma_a == "Sin ajuste" and forma_b == "Sin ajuste")
 
     st.caption(
-        "El modelo base no se recalcula. El ajuste por contexto es una capa heurística separada "
-        "que ayuda a interpretar y comparar el resultado."
+        "El modelo base es estadístico. El ajuste por contexto y forma reciente recalcula goles esperados de manera heurística; "
+        "no representa certeza, garantía ni un modelo entrenado con datos históricos de contexto."
     )
 
-    if contexto_normal and rotacion_baja:
+    if contexto_normal and rotacion_baja and sin_forma:
         st.info("Sin señales especiales de contexto competitivo. Interpretar principalmente el modelo estadístico base.")
     else:
         condicionados = []
@@ -1055,7 +1057,7 @@ def renderizar_lectura_estrategica(contexto, equipo_a, equipo_b, ajustes_context
         if condicionados:
             lectura_partido = "Partido condicionado por clasificación: " + "; ".join(condicionados) + "."
         else:
-            lectura_partido = "El partido parece competitivo en condiciones normales de clasificación."
+            lectura_partido = "El partido parece normal en clasificación, pero puede matizarse por forma reciente o rotación."
 
         equipos_obligados = []
         if estado_obliga_a_atacar(estado_a):
@@ -1086,6 +1088,21 @@ def renderizar_lectura_estrategica(contexto, equipo_a, equipo_b, ajustes_context
         else:
             lectura_rotacion = "No aparecen señales fuertes de rotación por clasificación o eliminación."
 
+        formas = []
+        if partidos_forma > 0:
+            for equipo, forma in [(equipo_a, forma_a), (equipo_b, forma_b)]:
+                if forma != "Sin ajuste":
+                    formas.append(f"{equipo}: {forma.lower()}")
+
+        if formas:
+            lectura_forma = (
+                f"Forma reciente considerada sobre {partidos_forma} partido(s): " + "; ".join(formas) + "."
+            )
+        elif forma_a != "Sin ajuste" or forma_b != "Sin ajuste":
+            lectura_forma = "Hay forma reciente seleccionada, pero con 0 partidos considerados no se aplica ajuste."
+        else:
+            lectura_forma = "No se agregó ajuste por forma reciente en el torneo."
+
         incertidumbre = any([
             estado_a != "Normal",
             estado_b != "Normal",
@@ -1093,11 +1110,12 @@ def renderizar_lectura_estrategica(contexto, equipo_a, equipo_b, ajustes_context
             rotacion_b in ["Medio", "Alto"],
             diferencia_a > 0,
             diferencia_b > 0,
+            bool(formas),
         ])
 
         if incertidumbre:
-            lectura_incertidumbre = "El contexto aumenta la incertidumbre del marcador porque puede cambiar ritmo, intensidad o gestión de riesgos."
-            lectura_cautela = "Conviene interpretar el favorito con cautela: el modelo base no incorpora esta situación competitiva."
+            lectura_incertidumbre = "El contexto aumenta la incertidumbre del marcador porque puede cambiar ritmo, intensidad, exposición o gestión de riesgos."
+            lectura_cautela = "Conviene interpretar el favorito con cautela y comparar siempre base contra ajustado."
         else:
             lectura_incertidumbre = "El contexto no agrega una señal fuerte de incertidumbre adicional sobre el marcador."
             lectura_cautela = "El favorito puede leerse principalmente desde el modelo estadístico base."
@@ -1107,6 +1125,7 @@ def renderizar_lectura_estrategica(contexto, equipo_a, equipo_b, ajustes_context
                 f"- {lectura_partido}",
                 f"- {lectura_ataque}",
                 f"- {lectura_rotacion}",
+                f"- {lectura_forma}",
                 f"- {lectura_incertidumbre}",
                 f"- {lectura_cautela}",
             ])
@@ -1118,26 +1137,113 @@ def renderizar_lectura_estrategica(contexto, equipo_a, equipo_b, ajustes_context
         st.markdown("\n".join([f"- {regla}" for regla in reglas]))
 
 
-def renderizar_detalles_ajuste_contexto(contexto, ajustes_contexto):
-    st.markdown("### Ajuste por contexto competitivo")
-    st.caption("Ajuste heurístico, no entrenado. No reemplaza el modelo estadístico base.")
+def renderizar_marcadores(resultados, ajustes_contexto, comparar, modelo_unico=None):
+    st.markdown("### Marcadores más probables")
 
+    modelos = ["Poisson + Elo", "XGBoost"] if comparar else [modelo_unico]
+    for modelo in modelos:
+        st.markdown(f"#### {modelo}: base vs ajustado")
+        col_base, col_ajustado = st.columns(2, gap="small")
+        with col_base:
+            st.markdown("**Top marcadores base**")
+            st.dataframe(
+                tabla_marcadores(resultados[modelo]["marcadores"]),
+                use_container_width=True,
+                hide_index=True
+            )
+        with col_ajustado:
+            st.markdown("**Top marcadores ajustados**")
+            st.dataframe(
+                tabla_marcadores(ajustes_contexto[modelo]["marcadores"]),
+                use_container_width=True,
+                hide_index=True
+            )
+
+    st.markdown("#### Comparativa de marcadores base y ajustados")
+    st.dataframe(
+        crear_tabla_marcadores_base_ajustada(
+            resultados,
+            ajustes_contexto,
+            comparar=comparar,
+            modelo_unico=modelo_unico
+        ),
+        use_container_width=True,
+        hide_index=True
+    )
+
+
+def renderizar_matriz(resultados, ajustes_contexto, comparar, equipo_a, equipo_b, modelo_unico=None):
+    vista = st.radio(
+        "Vista de matriz",
+        ["Base", "Ajustada por contexto"],
+        horizontal=True
+    )
+    fuente = resultados if vista == "Base" else ajustes_contexto
+    modelos = ["Poisson + Elo", "XGBoost"] if comparar else [modelo_unico]
+    max_goles_matriz = 5
+    vmax_matriz = max(
+        float((fuente[modelo]["matriz"][:max_goles_matriz + 1, :max_goles_matriz + 1] * 100).max())
+        for modelo in modelos
+    )
+
+    columnas = st.columns(len(modelos), gap="small")
+    for columna, modelo in zip(columnas, modelos):
+        with columna:
+            st.markdown(f"#### {modelo}")
+            fig = graficar_marcadores(
+                fuente[modelo]["matriz"],
+                equipo_a,
+                equipo_b,
+                max_goles=max_goles_matriz,
+                vmin=0,
+                vmax=vmax_matriz
+            )
+            st.pyplot(fig, use_container_width=False)
+
+
+def renderizar_detalles_ajuste_contexto(contexto, resultados, ajustes_contexto, equipo_a, equipo_b):
+    st.markdown("### Goles esperados base vs ajustados")
+    filas_detalle = []
+
+    for modelo, resultado in resultados.items():
+        ajuste = ajustes_contexto[modelo]
+        filas_detalle.append({
+            "Modelo": modelo,
+            f"Base {equipo_a}": f"{resultado['goles_a']:.2f}",
+            f"Ajustado {equipo_a}": f"{ajuste['goles_a']:.2f}",
+            f"Cambio {equipo_a}": f"{ajuste['goles_a'] - resultado['goles_a']:+.2f}",
+            f"Base {equipo_b}": f"{resultado['goles_b']:.2f}",
+            f"Ajustado {equipo_b}": f"{ajuste['goles_b']:.2f}",
+            f"Cambio {equipo_b}": f"{ajuste['goles_b'] - resultado['goles_b']:+.2f}",
+            "Detalle modelo base": resultado["extra"]["Detalle"],
+        })
+
+    st.dataframe(pd.DataFrame(filas_detalle), use_container_width=True, hide_index=True)
+    st.caption("Diferencia en tablas de probabilidad = valor ajustado menos valor base, expresada en puntos porcentuales.")
+
+    st.markdown("### Contexto competitivo y forma reciente")
     tabla_contexto = pd.DataFrame([
         {
-            "Equipo": "Equipo A",
+            "Equipo": equipo_a,
             "Situación": contexto["estado_a"],
             "Diferencia necesaria": contexto["diferencia_a"],
             "Riesgo de rotación": contexto["rotacion_a"],
+            "Forma reciente": contexto["forma_a"],
+            "Partidos considerados": contexto["partidos_forma"],
         },
         {
-            "Equipo": "Equipo B",
+            "Equipo": equipo_b,
             "Situación": contexto["estado_b"],
             "Diferencia necesaria": contexto["diferencia_b"],
             "Riesgo de rotación": contexto["rotacion_b"],
+            "Forma reciente": contexto["forma_b"],
+            "Partidos considerados": contexto["partidos_forma"],
         },
     ])
     st.dataframe(tabla_contexto, use_container_width=True, hide_index=True)
 
+    st.markdown("### Reglas de ajuste aplicadas")
+    st.caption("Ajuste heurístico, no entrenado. No reemplaza el modelo estadístico base ni garantiza el resultado.")
     filas_reglas = []
     for modelo, ajuste in ajustes_contexto.items():
         for regla in ajuste["reglas"]:
@@ -1206,6 +1312,18 @@ with contexto_col_b:
     )
     rotacion_equipo_b = st.selectbox("Riesgo de rotación Equipo B", RIESGOS_ROTACION, index=0)
 
+st.markdown("### Forma reciente en el torneo")
+forma_col_a, forma_col_b, forma_col_partidos = st.columns(3)
+
+with forma_col_a:
+    forma_equipo_a = st.selectbox("Forma reciente Equipo A", FORMAS_TORNEO, index=0)
+
+with forma_col_b:
+    forma_equipo_b = st.selectbox("Forma reciente Equipo B", FORMAS_TORNEO, index=0)
+
+with forma_col_partidos:
+    partidos_forma = st.selectbox("Partidos recientes del torneo considerados", [0, 1, 2, 3], index=0)
+
 contexto_competitivo = {
     "estado_a": estado_equipo_a,
     "estado_b": estado_equipo_b,
@@ -1213,6 +1331,9 @@ contexto_competitivo = {
     "diferencia_b": int(diferencia_necesaria_b),
     "rotacion_a": rotacion_equipo_a,
     "rotacion_b": rotacion_equipo_b,
+    "forma_a": forma_equipo_a,
+    "forma_b": forma_equipo_b,
+    "partidos_forma": int(partidos_forma),
 }
 
 calcular = st.button("Calcular pronóstico", type="primary")
@@ -1252,6 +1373,7 @@ if calcular:
         with tab_resumen:
             renderizar_lectura_rapida(
                 resultados,
+                ajustes_contexto,
                 comparar,
                 equipo_a,
                 equipo_b,
@@ -1265,7 +1387,7 @@ if calcular:
                 ajustes_contexto=ajustes_contexto
             )
 
-            renderizar_cards_ajustadas(
+            renderizar_cards_resultado(
                 resultados,
                 ajustes_contexto,
                 comparar,
@@ -1274,123 +1396,49 @@ if calcular:
                 modelo_unico=modelo_elegido if not comparar else None
             )
 
-            renderizar_cards_principales(
+            st.markdown("### Cambio por contexto")
+            tabla_eventos = crear_tabla_cambio_contexto(
                 resultados,
-                comparar,
-                equipo_a,
-                equipo_b,
-                modelo_unico=modelo_elegido if not comparar else None
-            )
-
-            st.markdown("### Tabla comparativa")
-            tabla_eventos = crear_tabla_eventos(
-                resultados,
-                ajustes_contexto=ajustes_contexto,
+                ajustes_contexto,
                 comparar=comparar,
                 modelo_unico=modelo_elegido if not comparar else None
             )
             st.dataframe(tabla_eventos, use_container_width=True, hide_index=True)
 
         with tab_marcadores:
-            st.markdown("### Marcadores más probables")
-
-            if comparar:
-                col_poisson, col_xgb = st.columns(2)
-
-                with col_poisson:
-                    st.markdown("#### Top marcadores Poisson + Elo")
-                    st.dataframe(
-                        tabla_marcadores(resultados["Poisson + Elo"]["marcadores"]),
-                        use_container_width=True,
-                        hide_index=True
-                    )
-
-                with col_xgb:
-                    st.markdown("#### Top marcadores XGBoost")
-                    st.dataframe(
-                        tabla_marcadores(resultados["XGBoost"]["marcadores"]),
-                        use_container_width=True,
-                        hide_index=True
-                    )
-
-                st.markdown("#### Comparativa de marcadores")
-                st.dataframe(
-                    crear_tabla_marcadores_comparativa(resultados),
-                    use_container_width=True,
-                    hide_index=True
-                )
-            else:
-                st.dataframe(
-                    tabla_marcadores(resultados[modelo_elegido]["marcadores"]),
-                    use_container_width=True,
-                    hide_index=True
-                )
+            renderizar_marcadores(
+                resultados,
+                ajustes_contexto,
+                comparar,
+                modelo_unico=modelo_elegido if not comparar else None
+            )
 
         with tab_matriz:
-            if comparar:
-                max_goles_matriz = 5
-                vmax_matriz = max(
-                    float((resultados["Poisson + Elo"]["matriz"][:max_goles_matriz + 1, :max_goles_matriz + 1] * 100).max()),
-                    float((resultados["XGBoost"]["matriz"][:max_goles_matriz + 1, :max_goles_matriz + 1] * 100).max())
-                )
-                col_poisson, col_xgb = st.columns(2, gap="small")
-
-                with col_poisson:
-                    st.markdown("#### Poisson + Elo")
-                    fig_poisson = graficar_marcadores(
-                        resultados["Poisson + Elo"]["matriz"],
-                        equipo_a,
-                        equipo_b,
-                        max_goles=max_goles_matriz,
-                        vmin=0,
-                        vmax=vmax_matriz
-                    )
-                    st.pyplot(fig_poisson, use_container_width=False)
-
-                with col_xgb:
-                    st.markdown("#### XGBoost")
-                    fig_xgb = graficar_marcadores(
-                        resultados["XGBoost"]["matriz"],
-                        equipo_a,
-                        equipo_b,
-                        max_goles=max_goles_matriz,
-                        vmin=0,
-                        vmax=vmax_matriz
-                    )
-                    st.pyplot(fig_xgb, use_container_width=False)
-            else:
-                fig = graficar_marcadores(
-                    resultados[modelo_elegido]["matriz"],
-                    equipo_a,
-                    equipo_b
-                )
-                st.pyplot(fig, use_container_width=False)
+            renderizar_matriz(
+                resultados,
+                ajustes_contexto,
+                comparar,
+                equipo_a,
+                equipo_b,
+                modelo_unico=modelo_elegido if not comparar else None
+            )
 
         with tab_detalles:
-            filas_detalle = []
-
-            for modelo, resultado in resultados.items():
-                fila = {
-                    "Modelo": modelo,
-                    f"Goles esperados {equipo_a}": f"{resultado['goles_a']:.2f}",
-                    f"Goles esperados {equipo_b}": f"{resultado['goles_b']:.2f}",
-                    "Detalle": resultado["extra"]["Detalle"],
-                }
-                filas_detalle.append(fila)
-
-            st.dataframe(
-                pd.DataFrame(filas_detalle),
-                use_container_width=True,
-                hide_index=True
+            renderizar_detalles_ajuste_contexto(
+                contexto_competitivo,
+                resultados,
+                ajustes_contexto,
+                equipo_a,
+                equipo_b
             )
-            st.caption("Diferencia = XGBoost menos Poisson + Elo, expresada en puntos porcentuales.")
-            renderizar_detalles_ajuste_contexto(contexto_competitivo, ajustes_contexto)
 
 with st.expander("Notas importantes"):
     st.write(
         """
         Este predictor es experimental. Usa resultados históricos, Elo, Poisson y XGBoost.
+        El modelo base es estadístico; el ajuste por contexto competitivo y forma reciente es heurístico,
+        separado y todavía no entrenado con datos históricos de contexto.
         No considera lesiones, alineaciones confirmadas, clima, cuotas de apuestas, tácticas ni noticias de último minuto.
-        Las probabilidades son aproximaciones estadísticas, no garantías.
+        Las probabilidades son aproximaciones estadísticas, no garantías ni certezas.
         """
     )
