@@ -587,6 +587,17 @@ EVENTOS_COMPARACION = [
     ("Ambos marcan", "Ambos marcan"),
 ]
 
+ESTADOS_COMPETITIVOS = [
+    "Normal",
+    "Necesita ganar",
+    "Le sirve empatar",
+    "Necesita ganar por diferencia de goles",
+    "Ya clasificado",
+    "Ya eliminado",
+]
+
+RIESGOS_ROTACION = ["Bajo", "Medio", "Alto"]
+
 
 def formato_porcentaje(valor):
     return f"{valor:.1f}%"
@@ -783,6 +794,98 @@ def renderizar_lectura_rapida(resultados, comparar, equipo_a, equipo_b, modelo_u
         )
 
 
+def estado_obliga_a_atacar(estado):
+    return estado in ["Necesita ganar", "Necesita ganar por diferencia de goles"]
+
+
+def renderizar_lectura_estrategica(contexto, equipo_a, equipo_b):
+    st.markdown("### Lectura estratégica")
+
+    estado_a = contexto["estado_a"]
+    estado_b = contexto["estado_b"]
+    rotacion_a = contexto["rotacion_a"]
+    rotacion_b = contexto["rotacion_b"]
+    diferencia_a = contexto["diferencia_a"]
+    diferencia_b = contexto["diferencia_b"]
+
+    contexto_normal = estado_a == "Normal" and estado_b == "Normal"
+    rotacion_baja = rotacion_a == "Bajo" and rotacion_b == "Bajo"
+
+    st.caption(
+        "Esta lectura estratégica no recalcula el modelo ni altera las probabilidades numéricas; "
+        "solo agrega contexto para interpretar el resultado."
+    )
+
+    if contexto_normal and rotacion_baja:
+        st.info("Sin señales especiales de contexto competitivo. Interpretar principalmente el modelo estadístico base.")
+        return
+
+    condicionados = []
+    for equipo, estado in [(equipo_a, estado_a), (equipo_b, estado_b)]:
+        if estado != "Normal":
+            condicionados.append(f"{equipo}: {estado.lower()}")
+
+    if condicionados:
+        lectura_partido = "Partido condicionado por clasificación: " + "; ".join(condicionados) + "."
+    else:
+        lectura_partido = "El partido parece competitivo en condiciones normales de clasificación."
+
+    equipos_obligados = []
+    if estado_obliga_a_atacar(estado_a):
+        detalle = f"{equipo_a} está obligado a atacar"
+        if estado_a == "Necesita ganar por diferencia de goles" and diferencia_a > 0:
+            detalle += f" y necesita una diferencia de {diferencia_a} goles"
+        equipos_obligados.append(detalle)
+    if estado_obliga_a_atacar(estado_b):
+        detalle = f"{equipo_b} está obligado a atacar"
+        if estado_b == "Necesita ganar por diferencia de goles" and diferencia_b > 0:
+            detalle += f" y necesita una diferencia de {diferencia_b} goles"
+        equipos_obligados.append(detalle)
+
+    if equipos_obligados:
+        lectura_ataque = "; ".join(equipos_obligados) + "."
+    elif estado_a == "Le sirve empatar" or estado_b == "Le sirve empatar":
+        lectura_ataque = "Al menos un equipo puede priorizar control y cautela porque le sirve empatar."
+    else:
+        lectura_ataque = "No hay una obligación clara de atacar más allá del planteamiento normal del partido."
+
+    riesgos = []
+    for equipo, estado, rotacion in [(equipo_a, estado_a, rotacion_a), (equipo_b, estado_b, rotacion_b)]:
+        if estado in ["Ya clasificado", "Ya eliminado"] or rotacion in ["Medio", "Alto"]:
+            riesgos.append(f"{equipo}: rotación {rotacion.lower()} ({estado.lower()})")
+
+    if riesgos:
+        lectura_rotacion = "Riesgo de rotación o intensidad irregular: " + "; ".join(riesgos) + "."
+    else:
+        lectura_rotacion = "No aparecen señales fuertes de rotación por clasificación o eliminación."
+
+    incertidumbre = any([
+        estado_a != "Normal",
+        estado_b != "Normal",
+        rotacion_a in ["Medio", "Alto"],
+        rotacion_b in ["Medio", "Alto"],
+        diferencia_a > 0,
+        diferencia_b > 0,
+    ])
+
+    if incertidumbre:
+        lectura_incertidumbre = "El contexto aumenta la incertidumbre del marcador porque puede cambiar ritmo, intensidad o gestión de riesgos."
+        lectura_cautela = "Conviene interpretar el favorito con cautela: el modelo base no incorpora esta situación competitiva."
+    else:
+        lectura_incertidumbre = "El contexto no agrega una señal fuerte de incertidumbre adicional sobre el marcador."
+        lectura_cautela = "El favorito puede leerse principalmente desde el modelo estadístico base."
+
+    st.markdown(
+        "\n".join([
+            f"- {lectura_partido}",
+            f"- {lectura_ataque}",
+            f"- {lectura_rotacion}",
+            f"- {lectura_incertidumbre}",
+            f"- {lectura_cautela}",
+        ])
+    )
+
+
 # ----------------------------
 # Interfaz
 # ----------------------------
@@ -817,6 +920,40 @@ with col6:
         ["Comparar ambos", "Poisson + Elo", "XGBoost"],
         index=0
     )
+
+st.markdown("### Contexto competitivo")
+contexto_col_a, contexto_col_b = st.columns(2)
+
+with contexto_col_a:
+    estado_equipo_a = st.selectbox("Situación Equipo A", ESTADOS_COMPETITIVOS, index=0)
+    diferencia_necesaria_a = st.number_input(
+        "Diferencia de goles necesaria Equipo A",
+        min_value=0,
+        max_value=6,
+        value=0,
+        step=1
+    )
+    rotacion_equipo_a = st.selectbox("Riesgo de rotación Equipo A", RIESGOS_ROTACION, index=0)
+
+with contexto_col_b:
+    estado_equipo_b = st.selectbox("Situación Equipo B", ESTADOS_COMPETITIVOS, index=0)
+    diferencia_necesaria_b = st.number_input(
+        "Diferencia de goles necesaria Equipo B",
+        min_value=0,
+        max_value=6,
+        value=0,
+        step=1
+    )
+    rotacion_equipo_b = st.selectbox("Riesgo de rotación Equipo B", RIESGOS_ROTACION, index=0)
+
+contexto_competitivo = {
+    "estado_a": estado_equipo_a,
+    "estado_b": estado_equipo_b,
+    "diferencia_a": int(diferencia_necesaria_a),
+    "diferencia_b": int(diferencia_necesaria_b),
+    "rotacion_a": rotacion_equipo_a,
+    "rotacion_b": rotacion_equipo_b,
+}
 
 calcular = st.button("Calcular pronóstico", type="primary")
 
@@ -858,6 +995,12 @@ if calcular:
                 equipo_a,
                 equipo_b,
                 modelo_unico=modelo_elegido if not comparar else None
+            )
+
+            renderizar_lectura_estrategica(
+                contexto_competitivo,
+                equipo_a,
+                equipo_b
             )
 
             renderizar_cards_principales(
