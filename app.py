@@ -1336,16 +1336,17 @@ contexto_competitivo = {
     "partidos_forma": int(partidos_forma),
 }
 
-calcular = st.button("Calcular pronóstico", type="primary")
+calcular = st.button("Calcular pron?stico", type="primary")
 
 if calcular:
     if equipo_a == equipo_b:
         st.error("Selecciona dos equipos diferentes.")
+        st.session_state.pop("ultimo_pronostico", None)
     else:
         comparar = modelo_elegido == "Comparar ambos"
         modelos = ["Poisson + Elo", "XGBoost"] if comparar else [modelo_elegido]
 
-        with st.spinner("Calculando pronóstico..."):
+        with st.spinner("Calculando pron?stico..."):
             resultados = {
                 modelo: calcular_modelo(
                     modelo,
@@ -1359,78 +1360,104 @@ if calcular:
             }
             ajustes_contexto = crear_resultados_ajustados(resultados, contexto_competitivo)
 
-        sede = "cancha neutral" if neutral else "localía para Equipo A"
-        st.header(f"{equipo_a} vs {equipo_b}")
-        st.caption(f"{tipo_partido} | {sede} | {fecha.strftime('%d/%m/%Y')}")
+        st.session_state["ultimo_pronostico"] = {
+            "resultados": resultados,
+            "ajustes_contexto": ajustes_contexto,
+            "contexto_competitivo": contexto_competitivo,
+            "comparar": comparar,
+            "modelo_elegido": modelo_elegido,
+            "equipo_a": equipo_a,
+            "equipo_b": equipo_b,
+            "fecha": fecha,
+            "neutral": neutral,
+            "tipo_partido": tipo_partido,
+        }
 
-        tab_resumen, tab_marcadores, tab_matriz, tab_detalles = st.tabs([
-            "Resumen",
-            "Marcadores",
-            "Matriz de goles",
-            "Detalles técnicos"
-        ])
+if "ultimo_pronostico" in st.session_state:
+    pronostico = st.session_state["ultimo_pronostico"]
+    resultados = pronostico["resultados"]
+    ajustes_contexto = pronostico["ajustes_contexto"]
+    contexto_competitivo = pronostico["contexto_competitivo"]
+    comparar = pronostico["comparar"]
+    modelo_elegido = pronostico["modelo_elegido"]
+    equipo_a = pronostico["equipo_a"]
+    equipo_b = pronostico["equipo_b"]
+    fecha = pronostico["fecha"]
+    neutral = pronostico["neutral"]
+    tipo_partido = pronostico["tipo_partido"]
 
-        with tab_resumen:
-            renderizar_lectura_rapida(
-                resultados,
-                ajustes_contexto,
-                comparar,
-                equipo_a,
-                equipo_b,
-                modelo_unico=modelo_elegido if not comparar else None
-            )
+    sede = "cancha neutral" if neutral else "local?a para Equipo A"
+    st.header(f"{equipo_a} vs {equipo_b}")
+    st.caption(f"{tipo_partido} | {sede} | {fecha.strftime('%d/%m/%Y')}")
 
-            renderizar_lectura_estrategica(
-                contexto_competitivo,
-                equipo_a,
-                equipo_b,
-                ajustes_contexto=ajustes_contexto
-            )
+    tab_resumen, tab_marcadores, tab_matriz, tab_detalles = st.tabs([
+        "Resumen",
+        "Marcadores",
+        "Matriz de goles",
+        "Detalles t?cnicos"
+    ])
 
-            renderizar_cards_resultado(
-                resultados,
-                ajustes_contexto,
-                comparar,
-                equipo_a,
-                equipo_b,
-                modelo_unico=modelo_elegido if not comparar else None
-            )
+    with tab_resumen:
+        renderizar_lectura_rapida(
+            resultados,
+            ajustes_contexto,
+            comparar,
+            equipo_a,
+            equipo_b,
+            modelo_unico=modelo_elegido if not comparar else None
+        )
 
-            st.markdown("### Cambio por contexto")
-            tabla_eventos = crear_tabla_cambio_contexto(
-                resultados,
-                ajustes_contexto,
-                comparar=comparar,
-                modelo_unico=modelo_elegido if not comparar else None
-            )
-            st.dataframe(tabla_eventos, use_container_width=True, hide_index=True)
+        renderizar_lectura_estrategica(
+            contexto_competitivo,
+            equipo_a,
+            equipo_b,
+            ajustes_contexto=ajustes_contexto
+        )
 
-        with tab_marcadores:
-            renderizar_marcadores(
-                resultados,
-                ajustes_contexto,
-                comparar,
-                modelo_unico=modelo_elegido if not comparar else None
-            )
+        renderizar_cards_resultado(
+            resultados,
+            ajustes_contexto,
+            comparar,
+            equipo_a,
+            equipo_b,
+            modelo_unico=modelo_elegido if not comparar else None
+        )
 
-        with tab_matriz:
-            renderizar_matriz(
-                resultados,
-                ajustes_contexto,
-                comparar,
-                equipo_a,
-                equipo_b,
-                modelo_unico=modelo_elegido if not comparar else None
-            )
+        st.markdown("### Cambio por contexto")
+        tabla_eventos = crear_tabla_cambio_contexto(
+            resultados,
+            ajustes_contexto,
+            comparar=comparar,
+            modelo_unico=modelo_elegido if not comparar else None
+        )
+        st.dataframe(tabla_eventos, use_container_width=True, hide_index=True)
 
-        with tab_detalles:
-            renderizar_detalles_ajuste_contexto(
-                contexto_competitivo,
-                resultados,
-                ajustes_contexto,
-                equipo_a,
-                equipo_b
-            )
+    with tab_marcadores:
+        renderizar_marcadores(
+            resultados,
+            ajustes_contexto,
+            comparar,
+            modelo_unico=modelo_elegido if not comparar else None
+        )
+
+    with tab_matriz:
+        renderizar_matriz(
+            resultados,
+            ajustes_contexto,
+            comparar,
+            equipo_a,
+            equipo_b,
+            modelo_unico=modelo_elegido if not comparar else None
+        )
+
+    with tab_detalles:
+        renderizar_detalles_ajuste_contexto(
+            contexto_competitivo,
+            resultados,
+            ajustes_contexto,
+            equipo_a,
+            equipo_b
+        )
 
 with st.expander("Notas importantes"):
     st.write(
